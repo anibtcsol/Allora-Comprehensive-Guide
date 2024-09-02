@@ -1,24 +1,37 @@
 import torch
 import torch.nn as nn
 import pandas as pd
+import numpy as np
 import requests
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-# Define the enhanced model with LSTM layers
-class EnhancedBiLSTMModel(nn.Module):
+# Enhanced BiLSTM model with Attention Mechanism and Dropout
+class EnhancedBiLSTMModelWithAttention(nn.Module):
     def __init__(self, input_size, hidden_layer_size, output_size, num_layers, dropout):
-        super(EnhancedBiLSTMModel, self).__init__()
+        super(EnhancedBiLSTMModelWithAttention, self).__init__()
         self.hidden_layer_size = hidden_layer_size
         self.num_layers = num_layers
         self.lstm = nn.LSTM(input_size, hidden_layer_size, num_layers=num_layers, dropout=dropout, batch_first=True, bidirectional=True)
-        self.linear = nn.Linear(hidden_layer_size * 2, output_size * 2)  # *2 for bidirectional and 2 timeframes
+        self.attention = nn.Linear(hidden_layer_size * 2, 1)
+        self.dropout = nn.Dropout(dropout)
+        self.linear = nn.Linear(hidden_layer_size * 2, output_size * 2)  # *2 for bidirectional LSTM and 2 timeframes
 
     def forward(self, input_seq):
-        h_0 = torch.zeros(self.num_layers * 2, input_seq.size(0), self.hidden_layer_size)
-        c_0 = torch.zeros(self.num_layers * 2, input_seq.size(0), self.hidden_layer_size)
-        
+        h_0 = torch.zeros(self.num_layers * 2, input_seq.size(0), self.hidden_layer_size).to(input_seq.device)
+        c_0 = torch.zeros(self.num_layers * 2, input_seq.size(0), self.hidden_layer_size).to(input_seq.device)
+
         lstm_out, _ = self.lstm(input_seq, (h_0, c_0))
-        predictions = self.linear(lstm_out[:, -1])
+        
+        # Attention mechanism
+        attn_weights = torch.softmax(self.attention(lstm_out), dim=1)
+        lstm_out = torch.sum(attn_weights * lstm_out, dim=1)
+        
+        # Apply dropout
+        lstm_out = self.dropout(lstm_out)
+        
+        predictions = self.linear(lstm_out)
         return predictions
 
 # Function to fetch historical data from Binance
@@ -40,31 +53,50 @@ def get_binance_data(symbol="ETHUSDT", interval="1m", limit=1000):
     else:
         raise Exception(f"Failed to retrieve data: {response.text}")
 
-# Prepare the dataset
+# Feature Engineering: Adding Technical Indicators
+def add_technical_indicators(df):
+    df['SMA_5'] = df['price'].rolling(window=5).mean()
+    df['SMA_15'] = df['price'].rolling(window=15).mean()
+    df['EMA_10'] = df['price'].ewm(span=10, adjust=False).mean()
+    df['Bollinger_Upper'] = df['SMA_15'] + (df['price'].rolling(window=15).std() * 2)
+    df['Bollinger_Lower'] = df['SMA_15'] - (df['price'].rolling(window=15).std() * 2)
+    df = df.dropna()  # Drop rows with NaN values after adding indicators
+    return df
+
+# Prepare the dataset with sliding window approach
 def prepare_dataset(symbols, sequence_length=10):
     all_data = []
     for symbol in symbols:
         df = get_binance_data(symbol)
+        df = add_technical_indicators(df)
+        
         scaler = MinMaxScaler(feature_range=(-1, 1))
-        scaled_data = scaler.fit_transform(df['price'].values.reshape(-1, 1))
-        for i in range(sequence_length, len(scaled_data) - 2):  # to account for the 20-minute prediction
+        scaled_data = scaler.fit_transform(df[['price', 'SMA_5', 'SMA_15', 'EMA_10', 'Bollinger_Upper', 'Bollinger_Lower']])
+        
+        for i in range(sequence_length, len(scaled_data) - 20):  # Consider the 20-minute prediction
             seq = scaled_data[i-sequence_length:i]
-            label_10 = scaled_data[i+10] if i+10 < len(scaled_data) else scaled_data[-1]
-            label_20 = scaled_data[i+20] if i+20 < len(scaled_data) else scaled_data[-1]
-            label = torch.FloatTensor([label_10[0], label_20[0]])
+            label_10 = scaled_data[i+10, 0]  # Only the price column
+            label_20 = scaled_data[i+20, 0]
+            label = torch.FloatTensor([label_10, label_20])
             all_data.append((seq, label))
     return all_data, scaler
 
-# Define the training process
-def train_model(model, data, epochs=50, lr=0.001, sequence_length=10):
+# Define the training process with early stopping
+def train_model(model, data, epochs=100, lr=0.001, sequence_length=10, patience=10):
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+
+    # Early stopping parameters
+    best_loss = float('inf')
+    patience_counter = 0
     
     for epoch in range(epochs):
         epoch_loss = 0
+        model.train()
         for seq, label in data:
-            seq = torch.FloatTensor(seq).view(1, sequence_length, -1)
-            label = label.view(1, -1)  # Ensure label has the shape [batch_size, 2]
+            seq = torch.FloatTensor(seq).view(1, sequence_length, -1).to(model.linear.weight.device)
+            label = label.view(1, -1).to(model.linear.weight.device)  # Ensure label has the shape [batch_size, 2]
 
             optimizer.zero_grad()
             y_pred = model(seq)
@@ -74,14 +106,26 @@ def train_model(model, data, epochs=50, lr=0.001, sequence_length=10):
 
             epoch_loss += loss.item()
 
-        print(f'Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(data)}')
+        avg_loss = epoch_loss / len(data)
+        scheduler.step(avg_loss)
+        print(f'Epoch {epoch+1}/{epochs}, Loss: {avg_loss}')
 
-    torch.save(model.state_dict(), "enhanced_bilstm_model.pth")
-    print("Model trained and saved as enhanced_bilstm_model.pth")
+        # Early stopping logic
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), "best_enhanced_bilstm_model_with_attention.pth")
+            print("Best model saved.")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("Early stopping triggered.")
+                break
 
 if __name__ == "__main__":
     # Define the model
-    model = EnhancedBiLSTMModel(input_size=1, hidden_layer_size=115, output_size=1, num_layers=2, dropout=0.3)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = EnhancedBiLSTMModelWithAttention(input_size=6, hidden_layer_size=115, output_size=1, num_layers=2, dropout=0.3).to(device)
 
     # Symbols to train on
     symbols = ['BNBUSDT', 'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'ARBUSDT']
